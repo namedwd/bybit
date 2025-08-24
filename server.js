@@ -50,15 +50,29 @@ function connectBybit() {
                 "tickers.ETHUSDT",
                 "liquidation.ETHUSDT",
                 "kline.1.ETHUSDT",
-                // 필요시 더 추가
+                // SOL 추가
+                "publicTrade.SOLUSDT",
+                "orderbook.50.SOLUSDT",
+                "tickers.SOLUSDT",
             ]
         };
         
         bybitWS.send(JSON.stringify(subscribeMsg));
+        console.log('📡 구독 요청 전송됨');
         
         // 활성 포지션/주문 로드
         await loadActivePositions();
         await loadPendingOrders();
+        
+        // 초기 로드 후 즉시 체크
+        console.log('\n🔍 초기 주문 체크 시작...');
+        setTimeout(() => {
+            // 모든 심볼에 대해 현재 가격으로 체크
+            for (const [symbol, price] of lastPrices) {
+                console.log(`초기 체크: ${symbol} @ ${price.toFixed(2)}`);
+                checkPendingOrders(symbol, price);
+            }
+        }, 3000); // 3초 후 체크 (가격 데이터 수신 대기)
         
         // Ping 메시지 (연결 유지)
         setInterval(() => {
@@ -193,33 +207,65 @@ async function checkPositions(symbol, currentPrice) {
 
 // 대기 주문 체크
 async function checkPendingOrders(symbol, currentPrice) {
-    // 로그 추가
+    // 매번 로그 (디버깅용)
     if (pendingOrders.size > 0) {
-        console.log(`📋 Checking ${pendingOrders.size} pending orders for ${symbol} at price ${currentPrice}`);
+        // 주기적으로 상세 로그 출력
+        if (Math.random() < 0.05) { // 5% 확률로 상세 로그
+            console.log(`\n====== 주문 체크 ======`);
+            console.log(`📋 심볼: ${symbol}`);
+            console.log(`💵 현재가: ${currentPrice.toFixed(2)}`);
+            console.log(`📝 대기 주문 수: ${pendingOrders.size}`);
+            
+            for (const [orderId, order] of pendingOrders) {
+                console.log(`  - ${order.symbol} ${order.order_side} @ ${parseFloat(order.price).toFixed(2)}`);
+            }
+            console.log(`====================\n`);
+        }
     }
     
     for (const [orderId, order] of pendingOrders) {
-        if (order.symbol !== symbol || order.status !== 'pending') continue;
+        // 심볼 체크
+        if (order.symbol !== symbol) {
+            continue;
+        }
+        
+        // 상태 체크 (pending이 아니면 스킵)
+        if (order.status !== 'pending') {
+            console.log(`⚠️ 주문 ${orderId}는 pending이 아님: ${order.status}`);
+            pendingOrders.delete(orderId);
+            continue;
+        }
         
         let shouldFill = false;
         const orderPrice = parseFloat(order.price);
         
-        // Limit 주문 체결 조건 (더 명확하게)
+        // Limit 주문 체결 조건
         if (order.type === 'limit') {
-            // Buy Limit: 현재가가 주문가 이하로 떨어질 때
-            if ((order.side === 'buy' || order.order_side === 'buy') && currentPrice <= orderPrice) {
+            // Buy/Long 주문: 현재가가 주문가 이하로 떨어질 때
+            const isBuyOrder = order.side === 'buy' || order.order_side === 'buy';
+            const isSellOrder = order.side === 'sell' || order.order_side === 'sell';
+            
+            if (isBuyOrder && currentPrice <= orderPrice) {
                 shouldFill = true;
-                console.log(`✅ Buy Limit 주문 체결 조건 충족: ${symbol} 현재가 ${currentPrice} <= 주문가 ${orderPrice}`);
+                console.log(`\n🎯 Buy Limit 체결 조건 충족!`);
+                console.log(`  심볼: ${symbol}`);
+                console.log(`  현재가: ${currentPrice.toFixed(2)}`);
+                console.log(`  주문가: ${orderPrice.toFixed(2)}`);
+                console.log(`  조건: ${currentPrice.toFixed(2)} <= ${orderPrice.toFixed(2)}\n`);
             } 
-            // Sell Limit: 현재가가 주문가 이상으로 오를 때
-            else if ((order.side === 'sell' || order.order_side === 'sell') && currentPrice >= orderPrice) {
+            // Sell/Short 주문: 현재가가 주문가 이상으로 오를 때
+            else if (isSellOrder && currentPrice >= orderPrice) {
                 shouldFill = true;
-                console.log(`✅ Sell Limit 주문 체결 조건 충족: ${symbol} 현재가 ${currentPrice} >= 주문가 ${orderPrice}`);
+                console.log(`\n🎯 Sell Limit 체결 조건 충족!`);
+                console.log(`  심볼: ${symbol}`);
+                console.log(`  현재가: ${currentPrice.toFixed(2)}`);
+                console.log(`  주문가: ${orderPrice.toFixed(2)}`);
+                console.log(`  조건: ${currentPrice.toFixed(2)} >= ${orderPrice.toFixed(2)}\n`);
             }
         }
         
         if (shouldFill) {
-            console.log(`🎯 주문 체결 시작: Order ID ${orderId}`);
+            console.log(`\n🚀 주문 체결 프로세스 시작: ${orderId}\n`);
             await fillOrder(orderId, currentPrice);
         }
     }
@@ -644,22 +690,51 @@ async function setupSupabaseSubscriptions() {
 
 // 서버 시작
 async function startServer() {
+    console.log('\n========================================');
+    console.log('🚀 Bybit Trading Server 시작 중...');
+    console.log('========================================');
+    console.log(`🕰️  시간: ${new Date().toLocaleString('ko-KR')}`);
+    console.log(`🌐 Supabase URL: ${process.env.SUPABASE_URL}`);
+    console.log(`🔑 Service Key: ${process.env.SUPABASE_SERVICE_KEY ? '✅ 설정됨' : '❌ 누락'}`);
+    console.log('========================================\n');
+    
+    if (!process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_KEY === 'your_service_key_here_from_supabase_dashboard') {
+        console.error('❌ ❌ ❌ 서비스 키가 설정되지 않았습니다!');
+        console.error('💡 .env 파일에 SUPABASE_SERVICE_KEY를 설정하세요.');
+        console.error('💡 Supabase Dashboard > Settings > API > service_role key를 복사하세요.\n');
+        process.exit(1);
+    }
+    
     // Bybit 연결
     connectBybit();
     
     // Supabase 구독 설정
     await setupSupabaseSubscriptions();
     
-    // 주기적 동기화 (1분마다)
+    // 주기적 동기화 (30초마다 - 디버깅용)
     setInterval(async () => {
+        console.log(`\n🔄 주기적 동기화... [${new Date().toLocaleTimeString('ko-KR')}]`);
         await loadActivePositions();
         await loadPendingOrders();
-    }, 60000);
+        
+        // 현재 가격 표시
+        if (lastPrices.size > 0) {
+            console.log('💰 현재 가격:');
+            for (const [symbol, price] of lastPrices) {
+                console.log(`  ${symbol}: ${price.toFixed(2)}`);
+            }
+        }
+    }, 30000); // 30초마다
     
     // HTTP 서버 시작
     const PORT = process.env.PORT || 3001;
     server.listen(PORT, () => {
-        console.log(`🚀 WebSocket 서버가 포트 ${PORT}에서 실행 중`);
+        console.log(`\n✅ WebSocket 서버가 포트 ${PORT}에서 실행 중`);
+        console.log(`🌐 http://localhost:${PORT}`);
+        console.log('\n💡 리밋 주문 테스트:');
+        console.log('  1. 현재가보다 낮은 가격에 Buy Limit 주문');
+        console.log('  2. 현재가보다 높은 가격에 Sell Limit 주문');
+        console.log('  3. 가격이 주문가에 도달하면 자동 체결\n');
     });
 }
 
