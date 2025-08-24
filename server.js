@@ -120,8 +120,29 @@ async function handlePriceUpdate(data) {
 
 // 포지션 체크 (익절/손절/청산)
 async function checkPositions(symbol, currentPrice) {
+    // 체크 전에 DB에서 최신 상태 확인
+    const positionsToCheck = [];
+    
     for (const [positionId, position] of activePositions) {
-        if (position.symbol !== symbol || position.status !== 'open') continue;
+        if (position.symbol === symbol && position.status === 'open') {
+            positionsToCheck.push({ id: positionId, ...position });
+        }
+    }
+    
+    // 각 포지션 체크
+    for (const position of positionsToCheck) {
+        // DB에서 현재 상태 재확인 (중복 방지)
+        const { data: currentPosition, error } = await supabase
+            .from('trading_positions')
+            .select('status')
+            .eq('id', position.id)
+            .single();
+        
+        if (error || !currentPosition || currentPosition.status !== 'open') {
+            // 이미 닫혔거나 없는 포지션은 메모리에서 제거
+            activePositions.delete(position.id);
+            continue;
+        }
         
         let shouldClose = false;
         let closeReason = '';
@@ -157,10 +178,10 @@ async function checkPositions(symbol, currentPrice) {
         
         // 포지션 종료
         if (shouldClose) {
-            await closePosition(positionId, currentPrice, closeReason, pnl);
+            await closePosition(position.id, currentPrice, closeReason, pnl);
         } else {
             // PnL 업데이트만
-            await updatePositionPnL(positionId, currentPrice, pnl, pnlPercentage);
+            await updatePositionPnL(position.id, currentPrice, pnl, pnlPercentage);
         }
     }
 }
@@ -202,6 +223,19 @@ async function closePosition(positionId, price, reason, pnl) {
         const position = activePositions.get(positionId);
         if (!position) return;
         
+        // 중복 방지: 이미 처리 중이거나 닫힌 포지션인지 DB에서 확인
+        const { data: currentStatus, error: statusError } = await supabase
+            .from('trading_positions')
+            .select('status')
+            .eq('id', positionId)
+            .single();
+        
+        if (statusError || !currentStatus || currentStatus.status !== 'open') {
+            console.log(`포지션 ${positionId}는 이미 처리됨 (status: ${currentStatus?.status})`);
+            activePositions.delete(positionId);
+            return;
+        }
+        
         // Supabase 업데이트
         const { error: posError } = await supabase
             .from('trading_positions')
@@ -221,12 +255,23 @@ async function closePosition(positionId, price, reason, pnl) {
         const returnAmount = reason === 'liquidation' ? 0 : position.margin + pnl;
         
         if (returnAmount > 0) {
-            const { error: balError } = await supabase.rpc('update_balance', {
-                user_id: position.user_id,
-                amount: returnAmount
-            });
+            // 현재 잔고 가져오기
+            const { data: userData, error: userError } = await supabase
+                .from('trading_users')
+                .select('balance')
+                .eq('id', position.user_id)
+                .single();
             
-            if (balError) throw balError;
+            if (!userError && userData) {
+                const newBalance = parseFloat(userData.balance) + returnAmount;
+                
+                const { error: balError } = await supabase
+                    .from('trading_users')
+                    .update({ balance: newBalance })
+                    .eq('id', position.user_id);
+                
+                if (balError) throw balError;
+            }
         }
         
         // 거래 내역 저장
@@ -244,7 +289,7 @@ async function closePosition(positionId, price, reason, pnl) {
         // 메모리에서 제거
         activePositions.delete(positionId);
         
-        console.log(`📊 포지션 종료: ${position.symbol} ${reason.toUpperCase()} at ${price}, PnL: ${pnl.toFixed(2)}`);
+        console.log(`📊 포지션 종료: ${position.symbol.replace('USDT', 'USD')} ${reason.toUpperCase()} at ${price}, PnL: ${pnl.toFixed(2)}`);
         
         // 클라이언트에 알림
         broadcastToClients(JSON.stringify({
@@ -330,7 +375,7 @@ async function fillOrder(orderId, price) {
         // 메모리에서 제거
         pendingOrders.delete(orderId);
         
-        console.log(`✅ 주문 체결: ${order.symbol} ${order.side} at ${price}`);
+        console.log(`✅ 주문 체결: ${order.symbol.replace('USDT', 'USD')} ${order.side} at ${price}`);
         
         // 클라이언트에 알림
         broadcastToClients(JSON.stringify({
@@ -358,7 +403,10 @@ async function loadActivePositions() {
         
         activePositions.clear();
         data.forEach(position => {
-            activePositions.set(position.id, position);
+            // status가 'open'인 것만 메모리에 추가
+            if (position.status === 'open') {
+                activePositions.set(position.id, position);
+            }
         });
         
         console.log(`📋 활성 포지션 ${activePositions.size}개 로드됨`);
@@ -450,7 +498,7 @@ wss.on('connection', (ws, req) => {
 
 // Supabase 실시간 구독 (새 포지션/주문 감지)
 async function setupSupabaseSubscriptions() {
-    // 새 포지션 감지
+    // 포지션 변경 감지 (INSERT, UPDATE, DELETE)
     supabase
         .channel('positions')
         .on('postgres_changes', {
@@ -462,6 +510,38 @@ async function setupSupabaseSubscriptions() {
                 activePositions.set(payload.new.id, payload.new);
                 console.log('📍 새 포지션 추가됨');
             }
+        })
+        .on('postgres_changes', {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'trading_positions'
+        }, async (payload) => {
+            // 포지션이 closed 또는 liquidated로 변경되면 즉시 메모리에서 제거
+            if (payload.new.status === 'closed' || payload.new.status === 'liquidated') {
+                activePositions.delete(payload.new.id);
+                console.log(`📊 포지션 ${payload.new.id} 메모리에서 즉시 제거됨 (status: ${payload.new.status}, reason: ${payload.new.close_reason})`);
+                
+                // 클라이언트에게 알림
+                broadcastToClients(JSON.stringify({
+                    type: 'position_removed_from_memory',
+                    data: {
+                        positionId: payload.new.id,
+                        status: payload.new.status,
+                        reason: payload.new.close_reason
+                    }
+                }));
+            } else if (payload.new.status === 'open') {
+                // 포지션 정보 업데이트
+                activePositions.set(payload.new.id, payload.new);
+            }
+        })
+        .on('postgres_changes', {
+            event: 'DELETE',
+            schema: 'public',
+            table: 'trading_positions'
+        }, async (payload) => {
+            activePositions.delete(payload.old.id);
+            console.log(`🗑️ 포지션 ${payload.old.id} 삭제됨`);
         })
         .subscribe();
     
