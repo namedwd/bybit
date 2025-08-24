@@ -451,9 +451,21 @@ async function fillOrder(orderId, price) {
         
         const margin = (order.size * price) / order.leverage;
         
-        // 🔥 중요: 지정가 주문 체결 시에는 증거금을 차감하지 않음
-        // 포지션의 증거금은 별도로 관리되며, 포지션 종료 시에만 잘고가 변경됨
-        // 따라서 여기서는 포지션만 생성하고 잘고는 그대로 유지
+        // 🔥 중요: 지정가 주문 체결 시 증거금 차감
+        const { data: userData, error: userError } = await supabase
+            .from('trading_users')
+            .select('balance')
+            .eq('id', order.user_id)
+            .single();
+        
+        if (!userError && userData) {
+            const newBalance = parseFloat(userData.balance) - margin;
+            await supabase
+                .from('trading_users')
+                .update({ balance: newBalance })
+                .eq('id', order.user_id);
+            console.log(`   잘고 변경: ${userData.balance} → ${newBalance.toFixed(2)} (-${margin.toFixed(2)})`);
+        }
         
         const { data: newPosition, error } = await supabase
             .from('trading_positions')
@@ -475,7 +487,7 @@ async function fillOrder(orderId, price) {
         if (!error && newPosition) {
             activePositions.set(newPosition.id, newPosition);
             console.log(`✅ 새 포지션 생성: ${newPosition.id.substring(0, 8)}`);
-            console.log(`   증거금: ${margin.toFixed(2)} (포지션에만 기록, 잘고 차감 안함)`);
+            console.log(`   증거금: ${margin.toFixed(2)}`);
         }
         
         pendingOrders.delete(orderId);
