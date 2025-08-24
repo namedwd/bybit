@@ -323,68 +323,61 @@ function calculatePnL(position, currentPrice) {
     }
 }
 
-// 포지션 종료
+// 포지션 종료 (DB 함수 사용)
 async function closePosition(positionId, price, reason, pnl) {
-    try {
-        const position = activePositions.get(positionId);
-        if (!position) return;
-        
-        const { data: currentStatus, error: statusError } = await supabase
-            .from('trading_positions')
-            .select('status')
-            .eq('id', positionId)
-            .single();
-        
-        if (statusError || !currentStatus || currentStatus.status !== 'open') {
-            activePositions.delete(positionId);
-            return;
-        }
-        
-        const { error: posError } = await supabase
-            .from('trading_positions')
-            .update({
-                status: reason === 'liquidation' ? 'liquidated' : 'closed',
-                mark_price: price,
-                pnl: pnl,
-                pnl_percentage: (pnl / position.margin) * 100,
-                closed_at: new Date().toISOString(),
-                close_reason: reason
-            })
-            .eq('id', positionId);
-        
-        if (posError) throw posError;
-        
-        const returnAmount = reason === 'liquidation' ? 0 : position.margin + pnl;
-        
-        if (returnAmount > 0) {
-            const { data: userData, error: userError } = await supabase
-                .from('trading_users')
-                .select('balance')
-                .eq('id', position.user_id)
-                .single();
-            
-            if (!userError && userData) {
-                const newBalance = parseFloat(userData.balance) + returnAmount;
-                
-                await supabase
-                    .from('trading_users')
-                    .update({ balance: newBalance })
-                    .eq('id', position.user_id);
-            }
-        }
-        
-        activePositions.delete(positionId);
-        
-        console.log(`📊 포지션 종료: ${position.symbol} ${reason.toUpperCase()} at $${price.toFixed(2)}, PnL: $${pnl.toFixed(2)}`);
-        
-        broadcastToClients(JSON.stringify({
-            type: 'position_closed',
-            data: { positionId, reason, price, pnl }
-        }));
-        
-    } catch (error) {
-        console.error('포지션 종료 에러:', error);
-    }
+try {
+const position = activePositions.get(positionId);
+if (!position) return;
+
+// 중복 처리 방지 체크
+const { data: currentStatus, error: statusError } = await supabase
+.from('trading_positions')
+.select('status')
+.eq('id', positionId)
+  .single();
+
+if (statusError || !currentStatus || currentStatus.status !== 'open') {
+activePositions.delete(positionId);
+  return;
+}
+
+// 🔥 DB 함수를 사용하여 원자적으로 처리
+const { data: result, error } = await supabase.rpc('close_position_with_balance', {
+p_position_id: positionId,
+p_close_price: price,
+p_pnl: pnl,
+p_close_reason: reason
+});
+
+if (error) {
+console.error('포지션 종료 DB 함수 에러:', error);
+  throw error;
+}
+
+if (result && result.success) {
+  activePositions.delete(positionId);
+  
+console.log(`📊 포지션 종료: ${position.symbol} ${reason.toUpperCase()} at $${price.toFixed(2)}, PnL: $${pnl.toFixed(2)}`);
+console.log(`   잔고 변경: $${result.old_balance} → $${result.new_balance} (+$${result.return_amount})`);
+
+broadcastToClients(JSON.stringify({
+type: 'position_closed',
+  data: { 
+    positionId, 
+  reason, 
+  price, 
+  pnl,
+newBalance: result.new_balance
+}
+}));
+} else {
+  console.error('포지션 종료 실패:', result?.error || '알 수 없는 오류');
+  activePositions.delete(positionId);
+}
+
+} catch (error) {
+console.error('포지션 종료 에러:', error);
+}
 }
 
 // 포지션 PnL 업데이트
@@ -458,19 +451,9 @@ async function fillOrder(orderId, price) {
         
         const margin = (order.size * price) / order.leverage;
         
-        const { data: userData, error: userError } = await supabase
-            .from('trading_users')
-            .select('balance')
-            .eq('id', order.user_id)
-            .single();
-        
-        if (!userError && userData) {
-            const newBalance = parseFloat(userData.balance) - margin;
-            await supabase
-                .from('trading_users')
-                .update({ balance: newBalance })
-                .eq('id', order.user_id);
-        }
+        // 🔥 중요: 지정가 주문 체결 시에는 증거금을 차감하지 않음
+        // 포지션의 증거금은 별도로 관리되며, 포지션 종료 시에만 잘고가 변경됨
+        // 따라서 여기서는 포지션만 생성하고 잘고는 그대로 유지
         
         const { data: newPosition, error } = await supabase
             .from('trading_positions')
@@ -492,11 +475,12 @@ async function fillOrder(orderId, price) {
         if (!error && newPosition) {
             activePositions.set(newPosition.id, newPosition);
             console.log(`✅ 새 포지션 생성: ${newPosition.id.substring(0, 8)}`);
+            console.log(`   증거금: ${margin.toFixed(2)} (포지션에만 기록, 잘고 차감 안함)`);
         }
         
         pendingOrders.delete(orderId);
         
-        console.log(`✅ 주문 체결 완료: ${order.symbol} ${order.order_side} at $${price.toFixed(2)}`);
+        console.log(`✅ 주문 체결 완료: ${order.symbol} ${order.order_side} at ${price.toFixed(2)}`);
         
         broadcastToClients(JSON.stringify({
             type: 'order_filled',
