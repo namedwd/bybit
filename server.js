@@ -403,7 +403,7 @@ async function updatePositionPnL(positionId, currentPrice, pnl, pnlPercentage) {
     }
 }
 
-// 주문 체결
+// 주문 체결 (포지션 통합 방식)
 async function fillOrder(orderId, price) {
     try {
         const order = pendingOrders.get(orderId);
@@ -442,7 +442,7 @@ async function fillOrder(orderId, price) {
                 filled_at: new Date().toISOString()
             })
             .eq('id', orderId)
-            .eq('status', 'pending'); // pending 상태일 때만 업데이트
+            .eq('status', 'pending');
         
         if (updateError) {
             console.error('주문 업데이트 에러:', updateError);
@@ -450,53 +450,53 @@ async function fillOrder(orderId, price) {
         }
         
         const margin = (order.size * price) / order.leverage;
+        const side = order.order_side === 'buy' ? 'long' : 'short';
         
-        // 🔥 중요: 지정가 주문 체결 시 증거금 차감
-        const { data: userData, error: userError } = await supabase
-            .from('trading_users')
-            .select('balance')
-            .eq('id', order.user_id)
-            .single();
+        // 🔥 포지션 통합 방식으로 처리
+        const { data: result, error } = await supabase.rpc('create_or_merge_position', {
+            p_user_id: order.user_id,
+            p_symbol: order.symbol,
+            p_side: side,
+            p_size: order.size,
+            p_entry_price: price,
+            p_leverage: order.leverage,
+            p_margin: margin,
+            p_tp_price: order.tp_price,
+            p_sl_price: order.sl_price
+        });
         
-        if (!userError && userData) {
-            const newBalance = parseFloat(userData.balance) - margin;
-            await supabase
-                .from('trading_users')
-                .update({ balance: newBalance })
-                .eq('id', order.user_id);
-            console.log(`   잘고 변경: ${userData.balance} → ${newBalance.toFixed(2)} (-${margin.toFixed(2)})`);
+        if (error) {
+            console.error('포지션 처리 에러:', error);
+            return;
         }
         
-        const { data: newPosition, error } = await supabase
-            .from('trading_positions')
-            .insert({
-                user_id: order.user_id,
-                symbol: order.symbol,
-                side: order.order_side === 'buy' ? 'long' : 'short',
-                size: order.size,
-                entry_price: price,
-                leverage: order.leverage,
-                margin: margin,
-                tp_price: order.tp_price,
-                sl_price: order.sl_price,
-                status: 'open'
-            })
-            .select()
-            .single();
-        
-        if (!error && newPosition) {
-            activePositions.set(newPosition.id, newPosition);
-            console.log(`✅ 새 포지션 생성: ${newPosition.id.substring(0, 8)}`);
-            console.log(`   증거금: ${margin.toFixed(2)}`);
+        if (result && result.success) {
+            // 포지션 다시 로드
+            await loadActivePositions();
+            
+            if (result.action === 'merged') {
+                console.log(`✅ 포지션 추가: ${order.symbol} ${side}`);
+                console.log(`   기존: ${result.old_size} @ ${result.old_entry_price}`);
+                console.log(`   추가: ${order.size} @ ${price}`);
+                console.log(`   결과: ${result.new_size} @ ${result.new_entry_price}`);
+            } else {
+                console.log(`✅ 새 포지션 생성: ${order.symbol} ${side}`);
+                console.log(`   수량: ${order.size} @ ${price}`);
+            }
         }
-        
-        pendingOrders.delete(orderId);
         
         console.log(`✅ 주문 체결 완료: ${order.symbol} ${order.order_side} at ${price.toFixed(2)}`);
         
         broadcastToClients(JSON.stringify({
             type: 'order_filled',
-            data: { orderId, symbol: order.symbol, side: order.order_side, price, size: order.size }
+            data: { 
+                orderId, 
+                symbol: order.symbol, 
+                side: order.order_side, 
+                price, 
+                size: order.size,
+                action: result?.action || 'created'
+            }
         }));
         
     } catch (error) {
