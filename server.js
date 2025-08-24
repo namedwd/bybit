@@ -123,6 +123,10 @@ let lastPrices = new Map();
 let priceLogCounter = 0;
 const PRICE_LOG_INTERVAL = 1000; // 1000번에 1번만 로그
 
+// 🔥 청산 체크 관리
+const closingPositions = new Set(); // 청산 중인 포지션 (중복 방지)
+const lastOrderCheckTime = new Map(); // 주문 체크는 스로틀링
+
 // Bybit WebSocket 연결 함수
 function connectBybit() {
     bybitWS = new WebSocket('wss://stream.bybit.com/v5/public/linear');
@@ -196,7 +200,7 @@ function connectBybit() {
     });
 }
 
-// 가격 업데이트 처리
+// 가격 업데이트 처리 (청산은 매번, 주문은 스로틀링)
 async function handlePriceUpdate(data) {
     if (!data.data || data.data.length === 0) return;
     
@@ -209,17 +213,148 @@ async function handlePriceUpdate(data) {
     
     // 가격 로그 제한 (1000번에 1번)
     if (++priceLogCounter % PRICE_LOG_INTERVAL === 0) {
-        console.log(`💹 ${symbol}: $${price.toFixed(2)} | 대기주문: ${pendingOrders.size}개`);
+        console.log(`💹 ${symbol}: ${price.toFixed(2)} | 포지션: ${activePositions.size}개 | 대기주문: ${pendingOrders.size}개`);
     }
     
-    // 포지션 체크
-    await checkPositions(symbol, price);
+    // 🔥 포지션 청산 체크 (매 틱마다 - 메모리 연산이므로 부하 없음)
+    checkLiquidations(symbol, price);
     
-    // 대기 주문 체크
-    await checkPendingOrders(symbol, price);
+    // 🔥 주문 체크는 스로틀링 (DB 작업 있으므로)
+    const now = Date.now();
+    const lastCheck = lastOrderCheckTime.get(symbol) || 0;
+    
+    if (now - lastCheck >= 100) { // 100ms 간격
+        lastOrderCheckTime.set(symbol, now);
+        // 비동기로 처리
+        setImmediate(() => checkPendingOrders(symbol, price));
+    }
 }
 
-// 포지션 체크 (익절/손절/청산)
+// 🔥 새로운 청산 체크 함수 (매 틱마다 실행 - 메모리 연산만)
+function checkLiquidations(symbol, currentPrice) {
+    // 해당 심볼의 포지션만 체크
+    for (const [positionId, position] of activePositions) {
+        // 이미 청산 중이거나 닫힌 포지션은 스킵
+        if (closingPositions.has(positionId) || position.status !== 'open') {
+            continue;
+        }
+        
+        if (position.symbol !== symbol) continue;
+        
+        // PnL 계산 (단순 연산)
+        const pnl = position.side === 'long'
+            ? (currentPrice - position.entry_price) * position.size
+            : (position.entry_price - currentPrice) * position.size;
+        
+        const pnlPercentage = (pnl / position.margin) * 100;
+        
+        // 청산선 도달 체크
+        if (pnlPercentage <= -80) {
+            // 중복 방지 플래그 설정
+            closingPositions.add(positionId);
+            
+            console.log(`\n🚨 청산 트리거!`);
+            console.log(`   심볼: ${symbol}`);
+            console.log(`   포지션: ${position.side.toUpperCase()}`);
+            console.log(`   진입가: ${position.entry_price.toFixed(2)}`);
+            console.log(`   현재가: ${currentPrice.toFixed(2)}`);
+            console.log(`   손실률: ${pnlPercentage.toFixed(2)}%`);
+            console.log(`   손실액: ${Math.abs(pnl).toFixed(2)}\n`);
+            
+            // 비동기로 DB 처리 (메인 스레드 블로킹 방지)
+            setImmediate(async () => {
+                await executeLiquidation(positionId, position, currentPrice, pnl);
+            });
+        }
+        // 청산 경고 (선택적)
+        else if (pnlPercentage <= -70 && pnlPercentage > -80) {
+            // 10초에 한 번만 경고 (스팸 방지)
+            const now = Date.now();
+            if (!position.lastWarning || now - position.lastWarning > 10000) {
+                position.lastWarning = now;
+                console.log(`⚠️  청산 임박: ${symbol} ${position.side} | 손실: ${pnlPercentage.toFixed(2)}%`);
+            }
+        }
+        
+        // 익절/손절 체크
+        if (position.tp_price || position.sl_price) {
+            let shouldClose = false;
+            let closeReason = '';
+            
+            if (position.side === 'long') {
+                if (position.tp_price && currentPrice >= position.tp_price) {
+                    shouldClose = true;
+                    closeReason = 'tp';
+                    console.log(`💰 익절 도달: ${symbol} LONG @ ${currentPrice.toFixed(2)}`);
+                } else if (position.sl_price && currentPrice <= position.sl_price) {
+                    shouldClose = true;
+                    closeReason = 'sl';
+                    console.log(`🛑 손절 도달: ${symbol} LONG @ ${currentPrice.toFixed(2)}`);
+                }
+            } else { // short
+                if (position.tp_price && currentPrice <= position.tp_price) {
+                    shouldClose = true;
+                    closeReason = 'tp';
+                    console.log(`💰 익절 도달: ${symbol} SHORT @ ${currentPrice.toFixed(2)}`);
+                } else if (position.sl_price && currentPrice >= position.sl_price) {
+                    shouldClose = true;
+                    closeReason = 'sl';
+                    console.log(`🛑 손절 도달: ${symbol} SHORT @ ${currentPrice.toFixed(2)}`);
+                }
+            }
+            
+            if (shouldClose && !closingPositions.has(positionId)) {
+                closingPositions.add(positionId);
+                setImmediate(async () => {
+                    await closePosition(positionId, currentPrice, closeReason, pnl);
+                });
+            }
+        }
+    }
+}
+
+// 청산 실행 함수 (DB 작업)
+async function executeLiquidation(positionId, position, price, pnl) {
+    try {
+        // DB 함수 호출
+        const { data: result, error } = await supabase.rpc('close_position_with_balance', {
+            p_position_id: positionId,
+            p_close_price: price,
+            p_pnl: pnl,
+            p_close_reason: 'liquidation'
+        });
+        
+        if (error) throw error;
+        
+        if (result && result.success) {
+            // 메모리에서 제거
+            activePositions.delete(positionId);
+            closingPositions.delete(positionId);
+            
+            console.log(`✅ 청산 완료!`);
+            console.log(`   반환 금액: $0 (청산으로 인한 전액 손실)`);
+            console.log(`   새 잔고: ${result.new_balance.toFixed(2)}\n`);
+            
+            // 클라이언트에게 알림
+            broadcastToClients(JSON.stringify({
+                type: 'liquidation',
+                data: {
+                    positionId,
+                    symbol: position.symbol,
+                    side: position.side,
+                    loss: Math.abs(pnl),
+                    newBalance: result.new_balance
+                }
+            }));
+        }
+    } catch (error) {
+        console.error('청산 실행 오류:', error);
+        // 실패 시 플래그 제거 (재시도 가능하도록)
+        closingPositions.delete(positionId);
+    }
+}
+
+// 기존 포지션 체크 함수 (TP/SL용으로 유지)
 async function checkPositions(symbol, currentPrice) {
     const positionsToCheck = [];
     
@@ -669,17 +804,18 @@ wss.on('connection', (ws, req) => {
 // 서버 시작
 async function startServer() {
     console.log('\n========================================');
-    console.log('🚀 Bybit Trading Server 시작 (개선 버전)');
+    console.log('🚀 Bybit Trading Server 시작 (청산 시스템 포함)');
     console.log('========================================');
     console.log(`🕰️  시간: ${new Date().toLocaleString('ko-KR')}`);
     console.log(`🌐 Supabase URL: ${process.env.SUPABASE_URL}`);
     console.log(`🔑 Service Key: ${process.env.SUPABASE_SERVICE_KEY ? '✅ 설정됨' : '❌ 누락'}`);
     console.log('========================================');
-    console.log('📌 주요 개선사항:');
-    console.log('  - Realtime 제거 (안정성 향상)');
-    console.log('  - HTTP 엔드포인트 추가 (/new-order, /cancel-order, /status)');
-    console.log('  - 가격 로그 제한 (1000번에 1번)');
-    console.log('  - 즉시 주문 알림 처리');
+    console.log('📌 주요 기능:');
+    console.log('  ✅ 실시간 청산 모니터링 (매 틱마다)');
+    console.log('  ✅ 익절/손절 자동 실행');
+    console.log('  ✅ Limit 주문 자동 체결');
+    console.log('  ✅ -80% 도달 시 자동 청산');
+    console.log('  ✅ -70% 도달 시 경고 알림');
     console.log('========================================\n');
     
     if (!process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_KEY === 'your_service_key_here_from_supabase_dashboard') {
@@ -704,6 +840,16 @@ async function startServer() {
             await loadPendingOrders();
         }
     }, 10000); // 10초마다 백업 체크
+    
+    // 🔥 백업 청산 체크 (1초마다 - 혹시 놓친 청산 처리)
+    setInterval(() => {
+        if (activePositions.size === 0) return;
+        
+        for (const [symbol, price] of lastPrices) {
+            // 메모리 연산이므로 부담 없음
+            checkLiquidations(symbol, price);
+        }
+    }, 1000); // 1초마다 백업 체크
     
     // HTTP 서버 시작
     const PORT = process.env.PORT || 3001;
