@@ -111,6 +111,11 @@ async function handlePriceUpdate(data) {
     // 현재 가격 저장
     lastPrices.set(symbol, price);
     
+    // 디버깅: 가격 업데이트 로그 (매 100번째 업데이트마다)
+    if (Math.random() < 0.01) { // 1% 확률로 로그
+        console.log(`💹 ${symbol} 현재가: ${price.toFixed(2)}, 대기 주문: ${pendingOrders.size}개`);
+    }
+    
     // 포지션 체크 (익절/손절/청산)
     await checkPositions(symbol, price);
     
@@ -480,9 +485,15 @@ async function loadPendingOrders() {
         pendingOrders.clear();
         data.forEach(order => {
             pendingOrders.set(order.id, order);
+            console.log(`📌 대기 주문 로드: ${order.symbol} ${order.order_side} @ ${parseFloat(order.price).toFixed(2)}`);
         });
         
-        console.log(`📋 대기 주문 ${pendingOrders.size}개 로드됨`);
+        console.log(`📋 총 대기 주문 ${pendingOrders.size}개 로드됨`);
+        
+        // 현재 가격과 비교
+        for (const [symbol, price] of lastPrices) {
+            console.log(`현재 ${symbol} 가격: ${price.toFixed(2)}`);
+        }
     } catch (error) {
         console.error('주문 로드 에러:', error);
     }
@@ -606,7 +617,26 @@ async function setupSupabaseSubscriptions() {
         }, async (payload) => {
             if (payload.new.status === 'pending' && payload.new.type === 'limit') {
                 pendingOrders.set(payload.new.id, payload.new);
-                console.log('📝 새 주문 추가됨');
+                console.log(`📝 새 주문 추가됨: ${payload.new.symbol} ${payload.new.order_side} @ ${parseFloat(payload.new.price).toFixed(2)}`);
+                
+                // 현재 가격과 즉시 비교
+                const currentPrice = lastPrices.get(payload.new.symbol);
+                if (currentPrice) {
+                    console.log(`현재 ${payload.new.symbol} 가격: ${currentPrice.toFixed(2)}`);
+                    // 즉시 체결 체크
+                    await checkPendingOrders(payload.new.symbol, currentPrice);
+                }
+            }
+        })
+        .on('postgres_changes', {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'trading_orders'
+        }, async (payload) => {
+            // 주문이 취소되거나 체결되면 메모리에서 제거
+            if (payload.new.status !== 'pending') {
+                pendingOrders.delete(payload.new.id);
+                console.log(`📝 주문 제거됨: ${payload.new.id} (status: ${payload.new.status})`);
             }
         })
         .subscribe();
