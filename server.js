@@ -416,6 +416,21 @@ async function fillOrder(orderId, price) {
         const order = pendingOrders.get(orderId);
         if (!order) return;
         
+        // 🔥 중복 체결 방지 - 메모리에서 즉시 제거
+        pendingOrders.delete(orderId);
+        
+        // DB 상태 확인 (이미 체결되었는지)
+        const { data: currentOrder, error: checkError } = await supabase
+            .from('trading_orders')
+            .select('status')
+            .eq('id', orderId)
+            .single();
+        
+        if (checkError || !currentOrder || currentOrder.status !== 'pending') {
+            console.log(`⚠️ 주문 ${orderId.substring(0, 8)} 이미 처리됨`);
+            return;
+        }
+        
         console.log(`📝 주문 체결 처리:`, {
             orderId: orderId.substring(0, 8),
             symbol: order.symbol,
@@ -425,6 +440,7 @@ async function fillOrder(orderId, price) {
             fillPrice: price
         });
         
+        // status를 먼저 업데이트 (중복 방지)
         const { error: updateError } = await supabase
             .from('trading_orders')
             .update({
@@ -432,7 +448,8 @@ async function fillOrder(orderId, price) {
                 filled_price: price,
                 filled_at: new Date().toISOString()
             })
-            .eq('id', orderId);
+            .eq('id', orderId)
+            .eq('status', 'pending'); // pending 상태일 때만 업데이트
         
         if (updateError) {
             console.error('주문 업데이트 에러:', updateError);
