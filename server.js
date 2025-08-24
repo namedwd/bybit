@@ -188,21 +188,33 @@ async function checkPositions(symbol, currentPrice) {
 
 // 대기 주문 체크
 async function checkPendingOrders(symbol, currentPrice) {
+    // 로그 추가
+    if (pendingOrders.size > 0) {
+        console.log(`📋 Checking ${pendingOrders.size} pending orders for ${symbol} at price ${currentPrice}`);
+    }
+    
     for (const [orderId, order] of pendingOrders) {
         if (order.symbol !== symbol || order.status !== 'pending') continue;
         
         let shouldFill = false;
+        const orderPrice = parseFloat(order.price);
         
-        // Limit 주문 체결 조건
+        // Limit 주문 체결 조건 (더 명확하게)
         if (order.type === 'limit') {
-            if (order.side === 'buy' && currentPrice <= order.price) {
+            // Buy Limit: 현재가가 주문가 이하로 떨어질 때
+            if ((order.side === 'buy' || order.order_side === 'buy') && currentPrice <= orderPrice) {
                 shouldFill = true;
-            } else if (order.side === 'sell' && currentPrice >= order.price) {
+                console.log(`✅ Buy Limit 주문 체결 조건 충족: ${symbol} 현재가 ${currentPrice} <= 주문가 ${orderPrice}`);
+            } 
+            // Sell Limit: 현재가가 주문가 이상으로 오를 때
+            else if ((order.side === 'sell' || order.order_side === 'sell') && currentPrice >= orderPrice) {
                 shouldFill = true;
+                console.log(`✅ Sell Limit 주문 체결 조건 충족: ${symbol} 현재가 ${currentPrice} >= 주문가 ${orderPrice}`);
             }
         }
         
         if (shouldFill) {
+            console.log(`🎯 주문 체결 시작: Order ID ${orderId}`);
             await fillOrder(orderId, currentPrice);
         }
     }
@@ -335,10 +347,22 @@ async function updatePositionPnL(positionId, currentPrice, pnl, pnlPercentage) {
 async function fillOrder(orderId, price) {
     try {
         const order = pendingOrders.get(orderId);
-        if (!order) return;
+        if (!order) {
+            console.log(`❌ 주문을 찾을 수 없음: ${orderId}`);
+            return;
+        }
+        
+        console.log(`📝 주문 체결 처리 중:`, {
+            orderId,
+            symbol: order.symbol,
+            side: order.order_side,
+            size: order.size,
+            orderPrice: order.price,
+            fillPrice: price
+        });
         
         // 주문 상태 업데이트
-        await supabase
+        const { error: updateError } = await supabase
             .from('trading_orders')
             .update({
                 status: 'filled',
@@ -347,8 +371,29 @@ async function fillOrder(orderId, price) {
             })
             .eq('id', orderId);
         
+        if (updateError) {
+            console.error('주문 업데이트 에러:', updateError);
+            return;
+        }
+        
         // 새 포지션 생성
+        // size는 이미 달러 금액이 아닌 BTC 수량이어야 함
         const margin = (order.size * price) / order.leverage;
+        
+        // 잔고 차감
+        const { data: userData, error: userError } = await supabase
+            .from('trading_users')
+            .select('balance')
+            .eq('id', order.user_id)
+            .single();
+        
+        if (!userError && userData) {
+            const newBalance = parseFloat(userData.balance) - margin;
+            await supabase
+                .from('trading_users')
+                .update({ balance: newBalance })
+                .eq('id', order.user_id);
+        }
         
         const { data: newPosition, error } = await supabase
             .from('trading_positions')
@@ -370,19 +415,25 @@ async function fillOrder(orderId, price) {
         if (!error && newPosition) {
             // 메모리에 추가
             activePositions.set(newPosition.id, newPosition);
+            console.log(`✅ 새 포지션 생성됨: ${newPosition.id}`);
+        } else if (error) {
+            console.error('포지션 생성 에러:', error);
         }
         
         // 메모리에서 제거
         pendingOrders.delete(orderId);
         
-        console.log(`✅ 주문 체결: ${order.symbol.replace('USDT', 'USD')} ${order.side} at ${price}`);
+        console.log(`✅ 주문 체결 완료: ${order.symbol.replace('USDT', 'USD')} ${order.order_side} at ${price}`);
         
         // 클라이언트에 알림
         broadcastToClients(JSON.stringify({
             type: 'order_filled',
             data: {
                 orderId,
-                price
+                symbol: order.symbol,
+                side: order.order_side,
+                price,
+                size: order.size
             }
         }));
         
