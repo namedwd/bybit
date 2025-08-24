@@ -424,6 +424,38 @@ async function fillOrder(orderId, price) {
             return;
         }
         
+        // 🔥 추가: 사용 가능한 잔고 확인
+        const { data: availableBalance, error: balanceError } = await supabase.rpc(
+            'get_available_balance',
+            { p_user_id: order.user_id }
+        );
+        
+        if (balanceError || availableBalance === null) {
+            console.error('잔고 확인 실패:', balanceError);
+            return;
+        }
+        
+        const margin = (order.size * price) / order.leverage;
+        
+        if (availableBalance < margin) {
+            console.log(`⚠️ 잔고 부족으로 주문 체결 불가:`);
+            console.log(`   주문 ID: ${orderId.substring(0, 8)}`);
+            console.log(`   사용 가능: ${availableBalance.toFixed(2)}`);
+            console.log(`   필요 증거금: ${margin.toFixed(2)}`);
+            
+            // 주문을 취소 상태로 변경
+            await supabase
+                .from('trading_orders')
+                .update({
+                    status: 'cancelled',
+                    close_reason: '잔고 부족',
+                    filled_at: new Date().toISOString()
+                })
+                .eq('id', orderId);
+            
+            return;
+        }
+        
         console.log(`📝 주문 체결 처리:`, {
             orderId: orderId.substring(0, 8),
             symbol: order.symbol,
@@ -449,10 +481,9 @@ async function fillOrder(orderId, price) {
             return;
         }
         
-        const margin = (order.size * price) / order.leverage;
         const side = order.order_side === 'buy' ? 'long' : 'short';
         
-        // 🔥 포지션 통합 방식으로 처리
+        // 🔥 포지션 통합 방식으로 처리 (DB 함수가 다시 검증함)
         const { data: result, error } = await supabase.rpc('create_or_merge_position', {
             p_user_id: order.user_id,
             p_symbol: order.symbol,
@@ -467,10 +498,28 @@ async function fillOrder(orderId, price) {
         
         if (error) {
             console.error('포지션 처리 에러:', error);
+            
+            // 주문을 다시 pending으로 복구
+            pendingOrders.set(orderId, order);
             return;
         }
         
-        if (result && result.success) {
+        if (!result || !result.success) {
+            console.error('포지션 생성 실패:', result?.error || '알 수 없는 오류');
+            
+            // 주문 취소 처리
+            await supabase
+                .from('trading_orders')
+                .update({
+                    status: 'cancelled',
+                    close_reason: result?.error || '포지션 생성 실패'
+                })
+                .eq('id', orderId);
+            
+            return;
+        }
+        
+        if (result.success) {
             // 포지션 다시 로드
             await loadActivePositions();
             
