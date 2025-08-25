@@ -354,68 +354,6 @@ async function executeLiquidation(positionId, position, price, pnl) {
     }
 }
 
-// 기존 포지션 체크 함수 (TP/SL용으로 유지)
-async function checkPositions(symbol, currentPrice) {
-    const positionsToCheck = [];
-    
-    for (const [positionId, position] of activePositions) {
-        if (position.symbol === symbol && position.status === 'open') {
-            positionsToCheck.push({ id: positionId, ...position });
-        }
-    }
-    
-    for (const position of positionsToCheck) {
-        // DB에서 현재 상태 재확인
-        const { data: currentPosition, error } = await supabase
-            .from('trading_positions')
-            .select('status')
-            .eq('id', position.id)
-            .single();
-        
-        if (error || !currentPosition || currentPosition.status !== 'open') {
-            activePositions.delete(position.id);
-            continue;
-        }
-        
-        let shouldClose = false;
-        let closeReason = '';
-        
-        // 익절/손절 체크
-        if (position.side === 'long') {
-            if (position.tp_price && currentPrice >= position.tp_price) {
-                shouldClose = true;
-                closeReason = 'tp';
-            } else if (position.sl_price && currentPrice <= position.sl_price) {
-                shouldClose = true;
-                closeReason = 'sl';
-            }
-        } else if (position.side === 'short') {
-            if (position.tp_price && currentPrice <= position.tp_price) {
-                shouldClose = true;
-                closeReason = 'tp';
-            } else if (position.sl_price && currentPrice >= position.sl_price) {
-                shouldClose = true;
-                closeReason = 'sl';
-            }
-        }
-        
-        const pnl = calculatePnL(position, currentPrice);
-        const pnlPercentage = (pnl / position.margin) * 100;
-        
-        // 청산 체크
-        if (pnlPercentage <= -80) {
-            shouldClose = true;
-            closeReason = 'liquidation';
-        }
-        
-        if (shouldClose) {
-            await closePosition(position.id, currentPrice, closeReason, pnl);
-        } else {
-            await updatePositionPnL(position.id, currentPrice, pnl, pnlPercentage);
-        }
-    }
-}
-
 // 대기 주문 체크
 async function checkPendingOrders(symbol, currentPrice) {
     for (const [orderId, order] of pendingOrders) {
@@ -515,30 +453,7 @@ console.error('포지션 종료 에러:', error);
 }
 }
 
-// 포지션 PnL 업데이트
-async function updatePositionPnL(positionId, currentPrice, pnl, pnlPercentage) {
-    try {
-        await supabase
-            .from('trading_positions')
-            .update({
-                mark_price: currentPrice,
-                pnl: pnl,
-                pnl_percentage: pnlPercentage
-            })
-            .eq('id', positionId);
-            
-        const position = activePositions.get(positionId);
-        if (position) {
-            position.mark_price = currentPrice;
-            position.pnl = pnl;
-            position.pnl_percentage = pnlPercentage;
-        }
-    } catch (error) {
-        console.error('PnL 업데이트 에러:', error);
-    }
-}
-
-// 주문 체결 (포지션 통합 방식)
+// 주문 체결 (포지션 통합 방식) - 🔥 잔고 체크 제거!
 async function fillOrder(orderId, price) {
     try {
         const order = pendingOrders.get(orderId);
@@ -559,37 +474,10 @@ async function fillOrder(orderId, price) {
             return;
         }
         
-        // 🔥 추가: 사용 가능한 잔고 확인
-        const { data: availableBalance, error: balanceError } = await supabase.rpc(
-            'get_available_balance',
-            { p_user_id: order.user_id }
-        );
-        
-        if (balanceError || availableBalance === null) {
-            console.error('잔고 확인 실패:', balanceError);
-            return;
-        }
-        
+        // 🔥 리밋 주문은 이미 생성 시점에 잔고를 확인했으므로
+        // 체결 시점에 추가 잔고 체크 불필요 - 제거!
         const margin = (order.size * price) / order.leverage;
-        
-        if (availableBalance < margin) {
-            console.log(`⚠️ 잔고 부족으로 주문 체결 불가:`);
-            console.log(`   주문 ID: ${orderId.substring(0, 8)}`);
-            console.log(`   사용 가능: ${availableBalance.toFixed(2)}`);
-            console.log(`   필요 증거금: ${margin.toFixed(2)}`);
-            
-            // 주문을 취소 상태로 변경
-            await supabase
-                .from('trading_orders')
-                .update({
-                    status: 'cancelled',
-                    close_reason: '잔고 부족',
-                    filled_at: new Date().toISOString()
-                })
-                .eq('id', orderId);
-            
-            return;
-        }
+        console.log(`✅ 리밋 주문 체결 진행: 예약된 증거금 $${margin.toFixed(2)} 사용`);
         
         console.log(`📝 주문 체결 처리:`, {
             orderId: orderId.substring(0, 8),
@@ -618,7 +506,8 @@ async function fillOrder(orderId, price) {
         
         const side = order.order_side === 'buy' ? 'long' : 'short';
         
-        // 🔥 포지션 통합 방식으로 처리 (DB 함수가 다시 검증함)
+        // 🔥 리밋 주문은 잔고 체크 없이 바로 포지션 생성
+        // (이미 주문 생성 시 잔고를 확인했음)
         const { data: result, error } = await supabase.rpc('create_or_merge_position', {
             p_user_id: order.user_id,
             p_symbol: order.symbol,
@@ -804,7 +693,7 @@ wss.on('connection', (ws, req) => {
 // 서버 시작
 async function startServer() {
     console.log('\n========================================');
-    console.log('🚀 Bybit Trading Server 시작 (청산 시스템 포함)');
+    console.log('🚀 Bybit Trading Server 시작 (개선 버전)');
     console.log('========================================');
     console.log(`🕰️  시간: ${new Date().toLocaleString('ko-KR')}`);
     console.log(`🌐 Supabase URL: ${process.env.SUPABASE_URL}`);
@@ -813,9 +702,13 @@ async function startServer() {
     console.log('📌 주요 기능:');
     console.log('  ✅ 실시간 청산 모니터링 (매 틱마다)');
     console.log('  ✅ 익절/손절 자동 실행');
-    console.log('  ✅ Limit 주문 자동 체결');
+    console.log('  ✅ Limit 주문 자동 체결 (잔고 중복 체크 제거)');
     console.log('  ✅ -80% 도달 시 자동 청산');
     console.log('  ✅ -70% 도달 시 경고 알림');
+    console.log('========================================');
+    console.log('🔥 개선사항:');
+    console.log('  - 리밋 주문 체결 시 잔고 체크 제거');
+    console.log('  - 이미 주문 생성 시 확인한 증거금 사용');
     console.log('========================================\n');
     
     if (!process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_KEY === 'your_service_key_here_from_supabase_dashboard') {
@@ -863,7 +756,8 @@ async function startServer() {
         console.log('\n💡 테스트 방법:');
         console.log('  1. Trading 페이지에서 리밋 주문 생성');
         console.log('  2. 서버 로그에서 "새 주문 알림 받음" 확인');
-        console.log('  3. 가격 도달 시 "체결 조건 충족" 확인\n');
+        console.log('  3. 가격 도달 시 "체결 조건 충족" 확인');
+        console.log('  4. 잔고 부족 오류 없이 체결 완료 확인\n');
     });
 }
 
