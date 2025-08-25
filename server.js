@@ -477,7 +477,7 @@ async function fillOrder(orderId, price) {
         // 🔥 리밋 주문은 이미 생성 시점에 잔고를 확인했으므로
         // 체결 시점에 추가 잔고 체크 불필요 - 제거!
         const margin = (order.size * price) / order.leverage;
-        console.log(`✅ 리밋 주문 체결 진행: 예약된 증거금 $${margin.toFixed(2)} 사용`);
+        console.log(`✅ 리밋 주문 체결 진행: 예약된 증거금 ${margin.toFixed(2)} 사용`);
         
         console.log(`📝 주문 체결 처리:`, {
             orderId: orderId.substring(0, 8),
@@ -488,25 +488,7 @@ async function fillOrder(orderId, price) {
             fillPrice: price
         });
         
-        // status를 먼저 업데이트 (중복 방지)
-        const { error: updateError } = await supabase
-            .from('trading_orders')
-            .update({
-                status: 'filled',
-                filled_price: price,
-                filled_at: new Date().toISOString()
-            })
-            .eq('id', orderId)
-            .eq('status', 'pending');
-        
-        if (updateError) {
-            console.error('주문 업데이트 에러:', updateError);
-            return;
-        }
-        
-        const side = order.order_side === 'buy' ? 'long' : 'short';
-        
-        // 🔥 리밋 주문 전용 함수 사용 (잔고 이중 차감 방지)
+        // 🔥 fill_limit_order 함수로 전체 처리 (상태 변경 + 포지션 생성)
         const { data: result, error } = await supabase.rpc('fill_limit_order', {
             p_order_id: orderId,
             p_fill_price: price
@@ -540,13 +522,11 @@ async function fillOrder(orderId, price) {
             await loadActivePositions();
             
             if (result.action === 'merged') {
-                console.log(`✅ 포지션 추가: ${order.symbol} ${side}`);
-                console.log(`   기존: ${result.old_size} @ ${result.old_entry_price}`);
-                console.log(`   추가: ${order.size} @ ${price}`);
-                console.log(`   결과: ${result.new_size} @ ${result.new_entry_price}`);
+                console.log(`✅ 포지션 추가: ${order.symbol} ${order.order_side}`);
+                console.log(`   포지션 ID: ${result.position_id}`);
             } else {
-                console.log(`✅ 새 포지션 생성: ${order.symbol} ${side}`);
-                console.log(`   수량: ${order.size} @ ${price}`);
+                console.log(`✅ 새 포지션 생성: ${order.symbol} ${order.order_side}`);
+                console.log(`   포지션 ID: ${result.position_id}`);
             }
         }
         
