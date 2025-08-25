@@ -506,18 +506,10 @@ async function fillOrder(orderId, price) {
         
         const side = order.order_side === 'buy' ? 'long' : 'short';
         
-        // 🔥 리밋 주문은 잔고 체크 없이 바로 포지션 생성
-        // (이미 주문 생성 시 잔고를 확인했음)
-        const { data: result, error } = await supabase.rpc('create_or_merge_position', {
-            p_user_id: order.user_id,
-            p_symbol: order.symbol,
-            p_side: side,
-            p_size: order.size,
-            p_entry_price: price,
-            p_leverage: order.leverage,
-            p_margin: margin,
-            p_tp_price: order.tp_price,
-            p_sl_price: order.sl_price
+        // 🔥 리밋 주문 전용 함수 사용 (잔고 이중 차감 방지)
+        const { data: result, error } = await supabase.rpc('fill_limit_order', {
+            p_order_id: orderId,
+            p_fill_price: price
         });
         
         if (error) {
