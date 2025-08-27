@@ -3,6 +3,23 @@ const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
+// 계산 헬퍼 함수들
+const calculatePnL = (position, currentPrice) => {
+  if (!position || !currentPrice) return 0;
+  const { side, entry_price, size } = position;
+  return side === 'long' 
+    ? (currentPrice - entry_price) * size
+    : (entry_price - currentPrice) * size;
+};
+
+const calculatePnLPercentage = (pnl, margin) => {
+  if (!margin || margin === 0) return 0;
+  return (pnl / margin) * 100;
+};
+
+const LIQUIDATION_THRESHOLD = -80; // 청산 임계값
+const WARNING_THRESHOLD = -70;     // 경고 임계값
+
 // Supabase 클라이언트 초기화
 const supabase = createClient(
     process.env.SUPABASE_URL,
@@ -241,15 +258,12 @@ function checkLiquidations(symbol, currentPrice) {
         
         if (position.symbol !== symbol) continue;
         
-        // PnL 계산 (단순 연산)
-        const pnl = position.side === 'long'
-            ? (currentPrice - position.entry_price) * position.size
-            : (position.entry_price - currentPrice) * position.size;
-        
-        const pnlPercentage = (pnl / position.margin) * 100;
+        // PnL 계산 (헬퍼 함수 사용)
+        const pnl = calculatePnL(position, currentPrice);
+        const pnlPercentage = calculatePnLPercentage(pnl, position.margin);
         
         // 청산선 도달 체크
-        if (pnlPercentage <= -80) {
+        if (pnlPercentage <= LIQUIDATION_THRESHOLD) {
             // 중복 방지 플래그 설정
             closingPositions.add(positionId);
             
@@ -267,7 +281,7 @@ function checkLiquidations(symbol, currentPrice) {
             });
         }
         // 청산 경고 (선택적)
-        else if (pnlPercentage <= -70 && pnlPercentage > -80) {
+        else if (pnlPercentage <= WARNING_THRESHOLD && pnlPercentage > LIQUIDATION_THRESHOLD) {
             // 10초에 한 번만 경고 (스팸 방지)
             const now = Date.now();
             if (!position.lastWarning || now - position.lastWarning > 10000) {
@@ -387,14 +401,7 @@ async function checkPendingOrders(symbol, currentPrice) {
     }
 }
 
-// PnL 계산
-function calculatePnL(position, currentPrice) {
-    if (position.side === 'long') {
-        return (currentPrice - position.entry_price) * position.size;
-    } else {
-        return (position.entry_price - currentPrice) * position.size;
-    }
-}
+
 
 // 포지션 종료 (DB 함수 사용)
 async function closePosition(positionId, price, reason, pnl) {
